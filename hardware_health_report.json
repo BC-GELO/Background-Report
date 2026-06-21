@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-06-21T00:23:32.309750",
+  "timestamp": "2026-06-21T00:31:08.634377",
   "components": {
     "system": {
       "hostname": "c-6a372acf-01471659-fa88b650577d",
       "kernel": "4.19.91-c8dfc93.al7.x86_64",
       "os": "Debian GNU/Linux 12 (bookworm)",
-      "uptime_days": 0.01,
-      "boot_time": "2026-06-21T00:05:30.010520"
+      "uptime_days": 0.02,
+      "boot_time": "2026-06-21T00:05:30.004999"
     },
     "cpu": {
       "name": "Intel(R) Xeon(R) Processor @ 2.50GHz",
@@ -23,7 +23,7 @@
       "total_gb": 1.03,
       "used_gb": 0.36,
       "available_gb": 0.67,
-      "usage_percent": 34.68,
+      "usage_percent": 34.75,
       "type": "Unknown",
       "speed_mhz": null,
       "channels": "Unknown",
@@ -79,16 +79,18 @@
       }
     ],
     "gpu": {
-      "name": "No GPU detected or integrated graphics",
-      "vendor": "Unknown",
+      "name": "Virtual/Cloud Environment (No direct GPU access)",
+      "vendor": "Virtual",
       "memory_mb": null,
       "temperature": null,
       "utilization": null,
       "driver": "Unknown",
       "health_status": "good",
       "issues": [
-        "Notice: No discrete GPU detected - using integrated graphics or virtual adapter",
-        "Notice: Performance may be limited for graphics-intensive tasks"
+        "Notice: Running in virtualized environment",
+        "Notice: GPU detection limited in VM/cloud instances",
+        "Notice: Running in virtualized/cloud environment",
+        "Notice: GPU detection limited - cloud instances typically use virtual adapters"
       ]
     }
   },
@@ -106,11 +108,11 @@
       9
     ],
     "gpu": [
-      8
+      6
     ],
     "battery": [
       0
     ]
   },
-  "overall_score": 8
+  "overall_score": 7
 }
