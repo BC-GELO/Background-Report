@@ -1,0 +1,102 @@
+{
+  "timestamp": "2026-06-21T00:08:23.730032",
+  "components": {
+    "system": {
+      "hostname": "c-6a372acf-01471659-fa88b650577d",
+      "kernel": "4.19.91-c8dfc93.al7.x86_64",
+      "os": "Debian GNU/Linux 12 (bookworm)",
+      "uptime_days": 0.0,
+      "boot_time": "2026-06-21T00:05:30.012008"
+    },
+    "cpu": {
+      "name": "Intel(R) Xeon(R) Processor @ 2.50GHz",
+      "cores": 2,
+      "threads": 2,
+      "current_freq": 2499.998,
+      "max_freq": 0,
+      "temperature": null,
+      "load": 0.02,
+      "health_status": "good",
+      "issues": []
+    },
+    "memory": {
+      "total_gb": 1.03,
+      "used_gb": 0.35,
+      "available_gb": 0.68,
+      "usage_percent": 34.26,
+      "type": "Unknown",
+      "speed_mhz": null,
+      "health_status": "good",
+      "issues": [
+        "Notice: Very low total memory (<2GB)",
+        "Warning: Memory errors detected in system logs"
+      ]
+    },
+    "storage": [
+      {
+        "name": "/dev/zram0",
+        "model": "Unknown",
+        "size": "0B",
+        "type": "disk",
+        "health_status": "good",
+        "smart_status": "unknown",
+        "temperature": null,
+        "power_on_hours": null,
+        "issues": []
+      },
+      {
+        "name": "/dev/vda",
+        "model": "Unknown",
+        "size": "10G",
+        "type": "disk",
+        "health_status": "good",
+        "smart_status": "unknown",
+        "temperature": null,
+        "power_on_hours": null,
+        "issues": []
+      },
+      {
+        "name": "/dev/pmem0",
+        "model": "Unknown",
+        "size": "168M",
+        "type": "disk",
+        "health_status": "good",
+        "smart_status": "unknown",
+        "temperature": null,
+        "power_on_hours": null,
+        "issues": []
+      }
+    ],
+    "gpu": {
+      "name": "Unknown",
+      "vendor": "Unknown",
+      "memory_mb": null,
+      "temperature": null,
+      "utilization": null,
+      "driver": "Unknown",
+      "health_status": "good",
+      "issues": []
+    }
+  },
+  "problems": [],
+  "scores": {
+    "cpu": [
+      10
+    ],
+    "memory": [
+      7
+    ],
+    "storage": [
+      10,
+      10,
+      10
+    ],
+    "gpu": [
+      10
+    ],
+    "battery": [
+      0
+    ]
+  },
+  "overall_score": 9
+}
