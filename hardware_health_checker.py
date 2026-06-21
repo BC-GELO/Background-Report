@@ -60,11 +60,23 @@ class HardwareChecker:
                 cpu_info['name'] = model_match.group(1).strip()
             
             # Count physical cores and threads
-            cores = len(re.findall(r'^processor\s*:', stdout, re.MULTILINE))
+            processor_lines = re.findall(r'^processor\s*:\s*(\d+)', stdout, re.MULTILINE)
+            cores = len(processor_lines)
             cpu_info['threads'] = cores
             
+            # Count unique physical IDs or core IDs
             phys_ids = set(re.findall(r'physical id\s*:\s*(\d+)', stdout))
-            cpu_info['cores'] = max(len(phys_ids) * (cores // max(len(phys_ids), 1)), cores)
+            core_ids = set(re.findall(r'^core id\s*:\s*(\d+)', stdout, re.MULTILINE))
+            
+            if len(phys_ids) > 0 and len(core_ids) > 0:
+                # Multi-socket system
+                cpu_info['cores'] = len(phys_ids) * len(core_ids)
+            elif len(core_ids) > 0:
+                # Single socket, multiple cores
+                cpu_info['cores'] = len(core_ids)
+            elif cores > 0:
+                # Fallback: assume 1 core per thread if we can't determine
+                cpu_info['cores'] = cores
         
         # Get frequency info
         stdout, _ = self.run_command("cat /proc/cpuinfo | grep MHz")
@@ -136,27 +148,42 @@ class HardwareChecker:
             'issues': []
         }
         
-        # Get memory info from /proc/meminfo
-        stdout, _ = self.run_command("cat /proc/meminfo")
-        if stdout:
-            total_kb = re.search(r'MemTotal:\s*(\d+)', stdout)
-            available_kb = re.search(r'MemAvailable:\s*(\d+)', stdout)
-            free_kb = re.search(r'MemFree:\s*(\d+)', stdout)
-            buffers_kb = re.search(r'Buffers:\s*(\d+)', stdout)
-            cached_kb = re.search(r'^Cached:\s*(\d+)', stdout, re.MULTILINE)
+        # Get memory info from /proc/meminfo - primary method that always works
+        stdout, retcode = self.run_command("cat /proc/meminfo")
+        if stdout and retcode == 0:
+            lines = stdout.split('\n')
+            mem_values = {}
+            for line in lines:
+                if ':' in line:
+                    parts = line.split(':')
+                    key = parts[0].strip()
+                    value_part = parts[1].strip().split()[0]
+                    if value_part.isdigit():
+                        mem_values[key] = int(value_part)
             
-            if total_kb:
-                mem_info['total_gb'] = round(int(total_kb.group(1)) / 1024 / 1024, 2)
+            # Extract values
+            total_kb = mem_values.get('MemTotal', 0)
+            free_kb = mem_values.get('MemFree', 0)
+            available_kb = mem_values.get('MemAvailable', 0)
+            buffers_kb = mem_values.get('Buffers', 0)
+            cached_kb = mem_values.get('Cached', 0)
             
-            if available_kb:
-                mem_info['available_gb'] = round(int(available_kb.group(1)) / 1024 / 1024, 2)
-                used = int(total_kb.group(1)) - int(available_kb.group(1))
-                mem_info['used_gb'] = round(used / 1024 / 1024, 2)
-                mem_info['usage_percent'] = round((used / int(total_kb.group(1))) * 100, 2)
-            elif free_kb and buffers_kb and cached_kb:
-                # Fallback calculation
-                free_total = int(free_kb.group(1)) + int(buffers_kb.group(1)) + int(cached_kb.group(1))
-                mem_info['available_gb'] = round(free_total / 1024 / 1024, 2)
+            if total_kb > 0:
+                # Convert KB to GB (1 GB = 1024 * 1024 KB)
+                mem_info['total_gb'] = round(total_kb / 1024 / 1024, 2)
+                
+                if available_kb > 0:
+                    mem_info['available_gb'] = round(available_kb / 1024 / 1024, 2)
+                    used_kb = total_kb - available_kb
+                    mem_info['used_gb'] = round(used_kb / 1024 / 1024, 2)
+                    mem_info['usage_percent'] = round((used_kb / total_kb) * 100, 2)
+                else:
+                    # Fallback: use free + buffers + cached
+                    available_calc = free_kb + buffers_kb + cached_kb
+                    mem_info['available_gb'] = round(available_calc / 1024 / 1024, 2)
+                    used_kb = total_kb - available_calc
+                    mem_info['used_gb'] = round(used_kb / 1024 / 1024, 2)
+                    mem_info['usage_percent'] = round((used_kb / total_kb) * 100, 2)
         
         # Try to get detailed RAM info from dmidecode (requires sudo)
         stdout, retcode = self.run_command("sudo dmidecode -t memory 2>/dev/null")
@@ -248,13 +275,17 @@ class HardwareChecker:
         """Check storage devices specifications and health."""
         storage_devices = []
         
-        # Get list of block devices with better model extraction
-        stdout, _ = self.run_command("lsblk -d -o NAME,MODEL,SIZE,TYPE,SERIAL 2>/dev/null | grep disk")
-        if not stdout:
-            # Fallback: just get device names
-            stdout, _ = self.run_command("lsblk -d -o NAME,SIZE 2>/dev/null | grep disk")
-            if not stdout:
-                return storage_devices
+        # Get list of block devices - try multiple methods
+        stdout, retcode = self.run_command("lsblk -d -o NAME,MODEL,SIZE,TYPE 2>/dev/null | grep -E 'disk|lvm'")
+        
+        if not stdout or retcode != 0:
+            # Fallback: just get device names and sizes
+            stdout, retcode = self.run_command("lsblk -d -o NAME,SIZE 2>/dev/null | grep -E 'disk|lvm'")
+            if not stdout or retcode != 0:
+                # Last resort: try /proc/partitions
+                stdout, retcode = self.run_command("cat /proc/partitions | tail -n +3 | awk '{print $4, $3}'")
+                if not stdout or retcode != 0:
+                    return storage_devices
         
         lines = stdout.split('\n')
         for line in lines:
@@ -262,42 +293,63 @@ class HardwareChecker:
             if len(parts) >= 2:
                 dev_name = parts[0]
                 
+                # Skip ram devices and loop devices unless they're significant
+                if dev_name.startswith('ram') or dev_name.startswith('loop'):
+                    continue
+                
                 # Try to get model from multiple sources
                 model = 'Unknown'
                 serial = 'N/A'
                 
-                # Try hdparm for model
-                stdout_hdparm, _ = self.run_command(f"sudo hdparm -I /dev/{dev_name} 2>/dev/null | grep 'Model Number'")
-                if stdout_hdparm:
-                    model = stdout_hdparm.replace('Model Number:', '').strip()
+                # Try reading from sysfs first (doesn't require sudo)
+                sysfs_model_path = f"/sys/block/{dev_name}/device/model"
+                stdout_sysfs, _ = self.run_command(f"cat {sysfs_model_path} 2>/dev/null")
+                if stdout_sysfs:
+                    model = stdout_sysfs.strip()
                 
-                # Try smartctl for model
-                if model == 'Unknown':
-                    stdout_smart, _ = self.run_command(f"sudo smartctl -i /dev/{dev_name} 2>/dev/null | grep 'Device Model'")
+                # Try hdparm for model (requires sudo)
+                if model == 'Unknown' or not model:
+                    stdout_hdparm, _ = self.run_command(f"hdparm -I /dev/{dev_name} 2>/dev/null | grep 'Model Number'")
+                    if stdout_hdparm:
+                        model = stdout_hdparm.replace('Model Number:', '').strip()
+                
+                # Try smartctl for model (requires sudo)
+                if model == 'Unknown' or not model:
+                    stdout_smart, _ = self.run_command(f"smartctl -i /dev/{dev_name} 2>/dev/null | grep 'Device Model'")
                     if stdout_smart:
                         model = stdout_smart.replace('Device Model:', '').strip()
                 
-                # Try lsscsi
-                if model == 'Unknown':
-                    stdout_lsscsi, _ = self.run_command("lsscsi 2>/dev/null")
-                    if stdout_lsscsi and dev_name in stdout_lsscsi:
-                        for lline in stdout_lsscsi.split('\n'):
-                            if dev_name in lline:
-                                # Extract model from lsscsi output
-                                model_parts = lline.split()
-                                if len(model_parts) > 4:
-                                    model = ' '.join(model_parts[4:-1]) if len(model_parts) > 5 else model_parts[-1]
-                                break
+                # Try to get serial from sysfs
+                sysfs_serial_path = f"/sys/block/{dev_name}/device/serial"
+                stdout_sysfs, _ = self.run_command(f"cat {sysfs_serial_path} 2>/dev/null")
+                if stdout_sysfs:
+                    serial = stdout_sysfs.strip()
                 
-                # Fallback to lsblk model if available
-                if model == 'Unknown' and len(parts) >= 4:
-                    potential_model = ' '.join(parts[1:-2]) if len(parts) > 3 else ''
-                    if potential_model and potential_model != '-':
-                        model = potential_model
+                # Get size from lsblk output or sysfs
+                size = 'Unknown'
+                if len(parts) >= 3:
+                    # Check if second-to-last is size (for lsblk output)
+                    size_candidate = parts[-2]
+                    if any(c.isdigit() for c in size_candidate):
+                        size = size_candidate
                 
-                # Get size
-                size = parts[-2] if len(parts) >= 2 else 'Unknown'
-                dev_type = parts[-1] if len(parts) >= 1 else 'disk'
+                # Fallback to sysfs for size
+                if size == 'Unknown':
+                    sysfs_size_path = f"/sys/block/{dev_name}/size"
+                    stdout_sysfs, _ = self.run_command(f"cat {sysfs_size_path} 2>/dev/null")
+                    if stdout_sysfs:
+                        try:
+                            sectors = int(stdout_sysfs.strip())
+                            size_gb = sectors * 512 / 1024 / 1024 / 1024
+                            if size_gb >= 1:
+                                size = f"{size_gb:.1f}G"
+                            else:
+                                size_mb = size_gb * 1024
+                                size = f"{size_mb:.0f}M"
+                        except:
+                            pass
+                
+                dev_type = parts[-1] if len(parts) >= 1 and parts[-1] in ['disk', 'lvm', 'dm'] else 'disk'
                 
                 device = {
                     'name': f"/dev/{dev_name}",
@@ -405,9 +457,9 @@ class HardwareChecker:
             'issues': []
         }
         
-        # Try lspci for GPU detection - look for both VGA and 3D controllers
-        stdout, _ = self.run_command("lspci | grep -iE 'vga|3d|display'")
-        if stdout:
+        # Method 1: Try lspci for GPU detection
+        stdout, retcode = self.run_command("lspci 2>/dev/null | grep -iE 'vga|3d|display'")
+        if stdout and retcode == 0:
             lines = stdout.split('\n')
             gpu_devices = []
             for line in lines:
@@ -429,6 +481,35 @@ class HardwareChecker:
                 elif 'vmware' in gpu_lower or 'qemu' in gpu_lower or 'virtual' in gpu_lower:
                     gpu_info['vendor'] = 'Virtual'
                     gpu_info['issues'].append("Notice: Virtual/Emulated GPU detected")
+        
+        # Method 2: Check /sys/class/drm for DRM devices (works in some VMs)
+        if gpu_info['vendor'] == 'Unknown':
+            stdout, _ = self.run_command("ls /sys/class/drm/ 2>/dev/null")
+            if stdout and 'card' in stdout:
+                # Found DRM cards, try to identify them
+                stdout, _ = self.run_command("cat /sys/class/drm/card*/device/vendor 2>/dev/null | head -1")
+                if stdout:
+                    vendor_id = stdout.strip().lower()
+                    if '0x8086' in vendor_id or 'intel' in vendor_id:
+                        gpu_info['vendor'] = 'Intel'
+                        gpu_info['name'] = 'Intel Integrated Graphics (DRM detected)'
+                    elif '0x10de' in vendor_id or 'nvidia' in vendor_id:
+                        gpu_info['vendor'] = 'NVIDIA'
+                        gpu_info['name'] = 'NVIDIA GPU (DRM detected)'
+                    elif '0x1002' in vendor_id or 'amd' in vendor_id:
+                        gpu_info['vendor'] = 'AMD'
+                        gpu_info['name'] = 'AMD GPU (DRM detected)'
+        
+        # Method 3: Check environment variables for virtualization
+        if gpu_info['vendor'] == 'Unknown':
+            # Check for common virtualization indicators
+            stdout, _ = self.run_command("cat /proc/cpuinfo | grep -i hypervisor")
+            if stdout:
+                # Running in a VM
+                gpu_info['vendor'] = 'Virtual'
+                gpu_info['name'] = 'Virtual/Cloud Environment (No direct GPU access)'
+                gpu_info['issues'].append("Notice: Running in virtualized environment")
+                gpu_info['issues'].append("Notice: GPU detection limited in VM/cloud instances")
         
         # Try to get NVIDIA GPU info with detailed specs
         stdout, _ = self.run_command("nvidia-smi --query-gpu=name,memory.total,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits 2>/dev/null")
@@ -469,10 +550,13 @@ class HardwareChecker:
             if stdout:
                 gpu_info['driver'] = f"Intel (device: {stdout.strip()})"
         
-        # Check if no discrete GPU found
-        if gpu_info['vendor'] in ['Unknown', 'Virtual'] or 'virtual' in gpu_info['name'].lower():
-            gpu_info['issues'].append("Notice: No discrete GPU detected - using integrated graphics or virtual adapter")
-            gpu_info['issues'].append("Notice: Performance may be limited for graphics-intensive tasks")
+        # Check if no discrete GPU found - only add notice if vendor is Virtual
+        if gpu_info['vendor'] == 'Virtual':
+            gpu_info['issues'].append("Notice: Running in virtualized/cloud environment")
+            gpu_info['issues'].append("Notice: GPU detection limited - cloud instances typically use virtual adapters")
+        elif gpu_info['vendor'] == 'Unknown':
+            gpu_info['issues'].append("Notice: No GPU detected - system may use basic display adapter")
+            gpu_info['issues'].append("Notice: Graphics performance may be limited")
         
         # Check for GPU errors in dmesg
         stdout, _ = self.run_command("dmesg 2>/dev/null | grep -iE 'gpu|graphics|drm|nvidia|radeon|amdgpu|i915' | grep -iE 'error|fault|failed' | tail -3")
