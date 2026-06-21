@@ -1,0 +1,49 @@
+{
+  "timestamp": "2026-06-20T19:31:05.421401",
+  "duration_tier": "standard",
+  "duration_seconds": 300,
+  "tests": {
+    "cpu": {
+      "workers": 4,
+      "duration_seconds": 300,
+      "avg_load_percent": 99.3,
+      "max_load_percent": 100.0,
+      "min_freq_mhz": 2300.0,
+      "max_freq_mhz": 2300.0,
+      "baseline_max_freq_mhz": 2400.0,
+      "max_temp_c": null,
+      "worker_errors": 0,
+      "issues": [
+        "Notice: Couldn't read CPU temperature during the test - needs HWiNFO64 or LibreHardwareMonitor on Windows"
+      ],
+      "health_status": "good"
+    },
+    "memory": {
+      "tested_gb": 2.25,
+      "cycles_completed": 97,
+      "pattern_errors": 0,
+      "issues": [],
+      "health_status": "good"
+    },
+    "disk": {
+      "tested_file_gb": 2.0,
+      "cycles_completed": 19,
+      "avg_write_mbps": 240.3,
+      "avg_read_mbps": 265.7,
+      "min_write_mbps": 221.3,
+      "min_read_mbps": 238.9,
+      "issues": [],
+      "health_status": "good"
+    },
+    "gpu": {
+      "compute_load_generated": false,
+      "samples_collected": 5,
+      "issues": [
+        "Notice: No CUDA-capable PyTorch found, so no real compute load was generated - install torch in your AI workstation's environment for a true GPU stress test, or use a dedicated tool like FurMark (Windows) / gpu-burn (Linux)"
+      ],
+      "max_temp_c": 0,
+      "avg_utilization_percent": 0.0,
+      "health_status": "good"
+    }
+  }
+}
