@@ -13,13 +13,29 @@ Optional (improves accuracy, no setup needed if present):
     - nvidia-smi on PATH -> detailed NVIDIA GPU stats on ANY platform
     - Windows: uses built-in PowerShell (Get-CimInstance / Get-PhysicalDisk) - no extra installs
     - Linux: uses dmidecode/smartctl/lsblk if installed (sudo for some details)
+    - torch with CUDA -> generates real GPU compute load for the stress test (already present
+      on most ComfyUI/Stable Diffusion setups); without it, GPU stress falls back to
+      monitoring-only mode.
+
+Run modes:
+    python hardware_health_checker.py                 -> interactive menu
+    python hardware_health_checker.py --mode health
+    python hardware_health_checker.py --mode stress --duration standard --yes
+    python hardware_health_checker.py --mode both
 """
 
-import subprocess
-import re
+import argparse
+import hashlib
 import json
+import multiprocessing
+import os
 import platform
+import re
 import shutil
+import subprocess
+import tempfile
+import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -996,18 +1012,614 @@ class HardwareChecker:
         return self.results
 
 
+DURATION_PRESETS = {
+    'quick': 60,
+    'standard': 300,
+    'extended': 900,
+}
+
+
+def _nvidia_smi_sample() -> Optional[Dict]:
+    """One-shot temp/utilization/memory sample. Works on any OS if nvidia-smi is on PATH."""
+    if not shutil.which('nvidia-smi'):
+        return None
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        parts = result.stdout.strip().split('\n')[0].split(', ')
+        return {
+            'temp_c': int(parts[0]),
+            'util_percent': int(parts[1]),
+            'mem_used_mb': int(parts[2]),
+        }
+    except Exception:
+        return None
+
+
+def _cpu_burn_worker(end_time: float):
+    """Pure-stdlib CPU burn (SHA-256 loop). Runs in its own process per logical core."""
+    data = os.urandom(4096)
+    n = 0
+    while time.time() < end_time:
+        hashlib.sha256(data).digest()
+        n += 1
+    return n
+
+
+class StressTester:
+    """Sustained-load tests for CPU, memory, disk, and GPU to surface stability problems
+    that a point-in-time snapshot can't catch (throttling, unstable RAM, slow/failing
+    drives, GPU instability)."""
+
+    def __init__(self):
+        self._stop_flag = threading.Event()
+
+    # -- monitoring -----------------------------------------------------
+
+    def _sample_cpu_monitor(self, interval: float, samples: List[Dict]):
+        while not self._stop_flag.is_set():
+            entry = {}
+            try:
+                entry['load_percent'] = psutil.cpu_percent(interval=None)
+            except Exception:
+                entry['load_percent'] = None
+            try:
+                freq = psutil.cpu_freq()
+                entry['freq_mhz'] = freq.current if freq else None
+            except Exception:
+                entry['freq_mhz'] = None
+            entry['temp_c'] = None
+            try:
+                temps = psutil.sensors_temperatures()
+                for _, entries_ in (temps or {}).items():
+                    for e in entries_:
+                        if e.current and 0 < e.current < 130:
+                            entry['temp_c'] = e.current
+                            break
+                    if entry['temp_c']:
+                        break
+            except Exception:
+                pass
+            samples.append(entry)
+            time.sleep(interval)
+
+    # -- CPU --------------------------------------------------------------
+
+    def stress_cpu(self, duration_seconds: int) -> Dict:
+        n_workers = psutil.cpu_count(logical=True) or 1
+        print(f"\n[CPU] Loading {n_workers} core(s) for {duration_seconds}s...")
+        end_time = time.time() + duration_seconds
+
+        samples: List[Dict] = []
+        self._stop_flag.clear()
+        monitor = threading.Thread(target=self._sample_cpu_monitor, args=(2, samples), daemon=True)
+        monitor.start()
+
+        baseline_freq = None
+        try:
+            f = psutil.cpu_freq()
+            baseline_freq = (f.max or f.current) if f else None
+        except Exception:
+            pass
+
+        procs = []
+        try:
+            for _ in range(n_workers):
+                p = multiprocessing.Process(target=_cpu_burn_worker, args=(end_time,))
+                p.start()
+                procs.append(p)
+            for p in procs:
+                p.join(timeout=duration_seconds + 30)
+        finally:
+            self._stop_flag.set()
+            monitor.join(timeout=5)
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+
+        worker_errors = sum(1 for p in procs if p.exitcode not in (0,))
+
+        loads = [s['load_percent'] for s in samples if s.get('load_percent') is not None]
+        freqs = [s['freq_mhz'] for s in samples if s.get('freq_mhz') is not None]
+        temps = [s['temp_c'] for s in samples if s.get('temp_c') is not None]
+
+        result = {
+            'workers': n_workers,
+            'duration_seconds': duration_seconds,
+            'avg_load_percent': round(sum(loads) / len(loads), 1) if loads else None,
+            'max_load_percent': round(max(loads), 1) if loads else None,
+            'min_freq_mhz': round(min(freqs), 0) if freqs else None,
+            'max_freq_mhz': round(max(freqs), 0) if freqs else None,
+            'baseline_max_freq_mhz': round(baseline_freq, 0) if baseline_freq else None,
+            'max_temp_c': round(max(temps), 1) if temps else None,
+            'worker_errors': worker_errors,
+            'issues': []
+        }
+
+        if worker_errors:
+            result['issues'].append(f"Critical: {worker_errors} CPU stress worker(s) crashed during the test")
+
+        if result['max_temp_c']:
+            if result['max_temp_c'] > 95:
+                result['issues'].append(f"Critical: CPU hit {result['max_temp_c']}°C under load - check cooling immediately")
+            elif result['max_temp_c'] > 85:
+                result['issues'].append(f"Warning: CPU reached {result['max_temp_c']}°C under sustained load")
+        elif IS_WINDOWS:
+            result['issues'].append(
+                "Notice: Couldn't read CPU temperature during the test - needs HWiNFO64 or "
+                "LibreHardwareMonitor on Windows"
+            )
+
+        if baseline_freq and result['min_freq_mhz'] and result['min_freq_mhz'] < baseline_freq * 0.7:
+            result['issues'].append(
+                f"Warning: CPU frequency dropped to {result['min_freq_mhz']:.0f} MHz "
+                f"(baseline max {baseline_freq:.0f} MHz) under load - possible thermal "
+                f"throttling or power limiting"
+            )
+
+        if result['avg_load_percent'] is not None and result['avg_load_percent'] < 80:
+            result['issues'].append(
+                "Notice: Average load stayed below 80% - the test may have been throttled or interrupted"
+            )
+
+        result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else \
+                                   'warning' if any('Warning' in i for i in result['issues']) else 'good'
+        return result
+
+    # -- Memory -----------------------------------------------------------
+
+    def stress_memory(self, duration_seconds: int) -> Dict:
+        available = psutil.virtual_memory().available
+        test_size = int(min(available * 0.5, 8 * 1024 ** 3))
+        chunk = 64 * 1024 * 1024
+        test_size -= test_size % chunk
+
+        print(f"\n[MEMORY] Pattern-testing {test_size / 1024**3:.2f} GB of RAM for {duration_seconds}s...")
+
+        if test_size < chunk:
+            return {
+                'tested_gb': 0,
+                'issues': ["Notice: Not enough available memory to run a meaningful stress test"],
+                'health_status': 'good'
+            }
+
+        n_chunks = test_size // chunk
+        pattern_a = bytes([0xAA]) * chunk
+        pattern_b = bytes([0x55]) * chunk
+
+        try:
+            buf = bytearray(test_size)
+        except MemoryError:
+            return {
+                'tested_gb': round(test_size / 1024 ** 3, 2),
+                'issues': ["Critical: MemoryError while allocating the test buffer - system is low on usable RAM"],
+                'health_status': 'critical'
+            }
+
+        end_time = time.time() + duration_seconds
+        cycles = 0
+        errors = 0
+
+        try:
+            while time.time() < end_time:
+                pat = pattern_a if cycles % 2 == 0 else pattern_b
+                for i in range(n_chunks):
+                    s = i * chunk
+                    buf[s:s + chunk] = pat
+                for i in range(n_chunks):
+                    s = i * chunk
+                    if bytes(buf[s:s + chunk]) != pat:
+                        errors += 1
+                cycles += 1
+        finally:
+            del buf
+
+        result = {
+            'tested_gb': round(test_size / 1024 ** 3, 2),
+            'cycles_completed': cycles,
+            'pattern_errors': errors,
+            'issues': []
+        }
+        if errors:
+            result['issues'].append(
+                f"Critical: {errors} memory pattern mismatch(es) detected across {cycles} cycle(s) - "
+                f"possible faulty RAM"
+            )
+        if cycles == 0:
+            result['issues'].append("Notice: Test duration too short to complete a full pattern cycle")
+
+        result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else 'good'
+        return result
+
+    # -- Disk ---------------------------------------------------------------
+
+    def stress_disk(self, duration_seconds: int) -> Dict:
+        tmp_dir = tempfile.gettempdir()
+        try:
+            free = shutil.disk_usage(tmp_dir).free
+        except Exception:
+            free = 1024 ** 3
+
+        file_size = int(min(free * 0.1, 2 * 1024 ** 3))
+        chunk = 16 * 1024 * 1024
+        file_size -= file_size % chunk
+        file_size = max(file_size, chunk)
+
+        print(f"\n[DISK] Write/read/verify cycles with a {file_size / 1024**2:.0f} MB file for {duration_seconds}s...")
+
+        test_path = os.path.join(tmp_dir, f"hwcheck_stress_{os.getpid()}.tmp")
+        write_speeds, read_speeds, errors = [], [], []
+        end_time = time.time() + duration_seconds
+        cycles = 0
+
+        try:
+            while time.time() < end_time and cycles < 50:
+                data_block = os.urandom(chunk)
+                write_checksum = hashlib.sha256()
+
+                t0 = time.time()
+                with open(test_path, 'wb') as f:
+                    written = 0
+                    while written < file_size:
+                        f.write(data_block)
+                        write_checksum.update(data_block)
+                        written += chunk
+                    f.flush()
+                    os.fsync(f.fileno())
+                t1 = time.time()
+                write_speeds.append((file_size / (1024 ** 2)) / max(t1 - t0, 0.001))
+
+                read_checksum = hashlib.sha256()
+                t0 = time.time()
+                with open(test_path, 'rb') as f:
+                    while True:
+                        block = f.read(chunk)
+                        if not block:
+                            break
+                        read_checksum.update(block)
+                t1 = time.time()
+                read_speeds.append((file_size / (1024 ** 2)) / max(t1 - t0, 0.001))
+
+                if read_checksum.hexdigest() != write_checksum.hexdigest():
+                    errors.append(f"Cycle {cycles + 1}: data read back did not match data written")
+
+                cycles += 1
+        except OSError as e:
+            errors.append(f"OS error during disk test: {e}")
+        finally:
+            if os.path.exists(test_path):
+                try:
+                    os.remove(test_path)
+                except OSError:
+                    pass
+
+        result = {
+            'tested_file_gb': round(file_size / 1024 ** 3, 3),
+            'cycles_completed': cycles,
+            'avg_write_mbps': round(sum(write_speeds) / len(write_speeds), 1) if write_speeds else None,
+            'avg_read_mbps': round(sum(read_speeds) / len(read_speeds), 1) if read_speeds else None,
+            'min_write_mbps': round(min(write_speeds), 1) if write_speeds else None,
+            'min_read_mbps': round(min(read_speeds), 1) if read_speeds else None,
+            'issues': []
+        }
+
+        for err in errors:
+            if 'did not match' in err:
+                result['issues'].append(f"Critical: {err} - possible disk corruption or a failing drive")
+            else:
+                result['issues'].append(f"Warning: {err}")
+
+        if result['avg_write_mbps'] is not None and result['avg_write_mbps'] < 10:
+            result['issues'].append(f"Warning: Sustained write speed very low ({result['avg_write_mbps']} MB/s)")
+        if result['avg_read_mbps'] is not None and result['avg_read_mbps'] < 10:
+            result['issues'].append(f"Warning: Sustained read speed very low ({result['avg_read_mbps']} MB/s)")
+        if cycles == 0:
+            result['issues'].append("Notice: Not enough free disk space or time to complete a write/read cycle")
+
+        result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else \
+                                   'warning' if any('Warning' in i for i in result['issues']) else 'good'
+        return result
+
+    # -- GPU ------------------------------------------------------------------
+
+    def stress_gpu(self, duration_seconds: int) -> Dict:
+        has_nvidia_smi = shutil.which('nvidia-smi') is not None
+        torch_mod = None
+        torch_cuda = False
+        try:
+            import torch as torch_mod  # noqa: local import, optional dependency
+            torch_cuda = torch_mod.cuda.is_available()
+        except ImportError:
+            pass
+
+        print(f"\n[GPU] {'Generating CUDA compute load' if torch_cuda else 'Monitoring only (no compute load)'} "
+              f"for {duration_seconds if torch_cuda else min(duration_seconds, 10)}s...")
+
+        samples: List[Dict] = []
+        stop_evt = threading.Event()
+
+        def monitor_loop():
+            while not stop_evt.is_set():
+                s = _nvidia_smi_sample()
+                if s:
+                    samples.append(s)
+                time.sleep(2)
+
+        mon_thread = None
+        if has_nvidia_smi:
+            mon_thread = threading.Thread(target=monitor_loop, daemon=True)
+            mon_thread.start()
+
+        compute_error = None
+        if torch_cuda:
+            try:
+                device = torch_mod.device('cuda')
+                a = torch_mod.randn((4096, 4096), device=device)
+                b = torch_mod.randn((4096, 4096), device=device)
+                end_time = time.time() + duration_seconds
+                while time.time() < end_time:
+                    _ = a @ b
+                    torch_mod.cuda.synchronize()
+            except Exception as e:
+                compute_error = str(e)
+        else:
+            # No compute backend available - keep a short monitoring window only
+            time.sleep(min(duration_seconds, 10))
+
+        stop_evt.set()
+        if mon_thread:
+            mon_thread.join(timeout=5)
+
+        result = {
+            'compute_load_generated': torch_cuda and not compute_error,
+            'samples_collected': len(samples),
+            'issues': []
+        }
+
+        if not has_nvidia_smi:
+            result['issues'].append(
+                "Notice: nvidia-smi not found - can't monitor GPU temp/utilization "
+                "(non-NVIDIA GPU, or driver tools not on PATH)"
+            )
+        if not torch_cuda:
+            result['issues'].append(
+                "Notice: No CUDA-capable PyTorch found, so no real compute load was generated - "
+                "install torch in your AI workstation's environment for a true GPU stress test, "
+                "or use a dedicated tool like FurMark (Windows) / gpu-burn (Linux)"
+            )
+        if compute_error:
+            result['issues'].append(f"Critical: GPU compute load failed mid-test - {compute_error}")
+
+        if samples:
+            temps = [s['temp_c'] for s in samples if s.get('temp_c') is not None]
+            utils = [s['util_percent'] for s in samples if s.get('util_percent') is not None]
+            if temps:
+                result['max_temp_c'] = max(temps)
+                if result['max_temp_c'] > 90:
+                    result['issues'].append(f"Critical: GPU hit {result['max_temp_c']}°C under load")
+                elif result['max_temp_c'] > 83:
+                    result['issues'].append(f"Warning: GPU reached {result['max_temp_c']}°C under load")
+            if utils:
+                result['avg_utilization_percent'] = round(sum(utils) / len(utils), 1)
+                if torch_cuda and not compute_error and result['avg_utilization_percent'] < 50:
+                    result['issues'].append(
+                        "Notice: GPU utilization stayed low during the compute test - load may not have been effective"
+                    )
+
+        result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else \
+                                   'warning' if any('Warning' in i for i in result['issues']) else 'good'
+        return result
+
+
+def run_full_stress(duration_seconds: int, duration_tier: str) -> Dict:
+    """Run CPU, memory, disk, and GPU stress tests back to back."""
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'duration_tier': duration_tier,
+        'duration_seconds': duration_seconds,
+        'tests': {}
+    }
+    tester = StressTester()
+    results['tests']['cpu'] = tester.stress_cpu(duration_seconds)
+    results['tests']['memory'] = tester.stress_memory(duration_seconds)
+    results['tests']['disk'] = tester.stress_disk(duration_seconds)
+    results['tests']['gpu'] = tester.stress_gpu(duration_seconds)
+    return results
+
+
+def generate_stress_report(stress_results: Dict) -> str:
+    """Format the stress test results as a readable report."""
+    report = []
+    report.append("=" * 70)
+    report.append("HARDWARE STRESS TEST REPORT")
+    report.append("=" * 70)
+    report.append(f"Generated: {stress_results['timestamp']}")
+    report.append(f"Duration tier: {stress_results['duration_tier']} "
+                   f"({stress_results['duration_seconds']}s per component)")
+    report.append("")
+
+    tests = stress_results['tests']
+
+    cpu = tests.get('cpu', {})
+    report.append("-" * 70)
+    report.append("CPU STRESS TEST")
+    report.append("-" * 70)
+    if cpu:
+        report.append(f"Workers: {cpu.get('workers', 'N/A')}")
+        report.append(f"Avg Load: {cpu.get('avg_load_percent', 'N/A')}% | Max Load: {cpu.get('max_load_percent', 'N/A')}%")
+        if cpu.get('max_freq_mhz'):
+            report.append(
+                f"Frequency under load: {cpu.get('min_freq_mhz', 'N/A')}-{cpu.get('max_freq_mhz', 'N/A')} MHz "
+                f"(baseline max: {cpu.get('baseline_max_freq_mhz', 'N/A')} MHz)"
+            )
+        if cpu.get('max_temp_c'):
+            report.append(f"Max Temperature: {cpu['max_temp_c']}°C")
+        report.append(f"Health Status: {cpu.get('health_status', 'unknown').upper()}")
+        if cpu.get('issues'):
+            report.append("Issues:")
+            for issue in cpu['issues']:
+                report.append(f"  • {issue}")
+    report.append("")
+
+    mem = tests.get('memory', {})
+    report.append("-" * 70)
+    report.append("MEMORY STRESS TEST")
+    report.append("-" * 70)
+    if mem:
+        report.append(f"Tested: {mem.get('tested_gb', 'N/A')} GB | Cycles completed: {mem.get('cycles_completed', 'N/A')}")
+        report.append(f"Pattern Errors: {mem.get('pattern_errors', 0)}")
+        report.append(f"Health Status: {mem.get('health_status', 'unknown').upper()}")
+        if mem.get('issues'):
+            report.append("Issues:")
+            for issue in mem['issues']:
+                report.append(f"  • {issue}")
+    report.append("")
+
+    disk = tests.get('disk', {})
+    report.append("-" * 70)
+    report.append("DISK STRESS TEST")
+    report.append("-" * 70)
+    if disk:
+        report.append(f"Test file size: {disk.get('tested_file_gb', 'N/A')} GB | Cycles completed: {disk.get('cycles_completed', 'N/A')}")
+        report.append(f"Avg Write: {disk.get('avg_write_mbps', 'N/A')} MB/s | Avg Read: {disk.get('avg_read_mbps', 'N/A')} MB/s")
+        report.append(f"Health Status: {disk.get('health_status', 'unknown').upper()}")
+        if disk.get('issues'):
+            report.append("Issues:")
+            for issue in disk['issues']:
+                report.append(f"  • {issue}")
+    report.append("")
+
+    gpu = tests.get('gpu', {})
+    report.append("-" * 70)
+    report.append("GPU STRESS TEST")
+    report.append("-" * 70)
+    if gpu:
+        report.append(f"Compute load generated: {'Yes' if gpu.get('compute_load_generated') else 'No (monitoring only)'}")
+        if gpu.get('max_temp_c'):
+            report.append(f"Max Temperature: {gpu['max_temp_c']}°C")
+        if gpu.get('avg_utilization_percent') is not None:
+            report.append(f"Avg Utilization: {gpu['avg_utilization_percent']}%")
+        report.append(f"Health Status: {gpu.get('health_status', 'unknown').upper()}")
+        if gpu.get('issues'):
+            report.append("Issues:")
+            for issue in gpu['issues']:
+                report.append(f"  • {issue}")
+    report.append("")
+
+    all_critical, all_warning = [], []
+    for name, t in tests.items():
+        for issue in t.get('issues', []):
+            if 'Critical' in issue:
+                all_critical.append(f"{name.upper()}: {issue}")
+            elif 'Warning' in issue:
+                all_warning.append(f"{name.upper()}: {issue}")
+
+    report.append("=" * 70)
+    report.append("SUMMARY")
+    report.append("=" * 70)
+    if not all_critical and not all_warning:
+        report.append("No problems detected under sustained load. System looks stable.")
+    else:
+        if all_critical:
+            report.append(f"\n{len(all_critical)} CRITICAL issue(s) found:")
+            for i in all_critical:
+                report.append(f"  [CRITICAL] {i}")
+        if all_warning:
+            report.append(f"\n{len(all_warning)} WARNING(s) found:")
+            for i in all_warning:
+                report.append(f"  [WARNING] {i}")
+    report.append("\n" + "=" * 70)
+
+    return "\n".join(report)
+
+
+def prompt_duration() -> Tuple[str, int]:
+    print("\nSelect stress test duration (applies to each component - CPU, memory, disk, GPU):")
+    print("  1) Quick     (~1 min each, ~4 min total)")
+    print("  2) Standard  (~5 min each, ~20 min total)")
+    print("  3) Extended  (~15 min each, ~60 min total)")
+    choices = {'1': 'quick', '2': 'standard', '3': 'extended'}
+    while True:
+        choice = input("Enter 1, 2, or 3 [default: 2]: ").strip() or '2'
+        if choice in choices:
+            tier = choices[choice]
+            return tier, DURATION_PRESETS[tier]
+        print("Please enter 1, 2, or 3.")
+
+
+def confirm_stress_run() -> bool:
+    print("\nThis will fully load all CPU cores, allocate a large block of RAM, write a large "
+          "temporary file to disk, and (if supported) load the GPU.")
+    print("Make sure your system has adequate cooling. Press Ctrl+C at any time to stop early.")
+    answer = input("Continue? [y/N]: ").strip().lower()
+    return answer in ('y', 'yes')
+
+
 def main():
     """Main entry point."""
-    checker = HardwareChecker()
-    results = checker.run_full_check()
+    parser = argparse.ArgumentParser(description="Hardware health check and stress test")
+    parser.add_argument('--mode', choices=['health', 'stress', 'both'],
+                         help="Skip the interactive menu and run this mode directly")
+    parser.add_argument('--duration', choices=['quick', 'standard', 'extended'],
+                         help="Stress test duration tier (skips the interactive prompt)")
+    parser.add_argument('--yes', action='store_true',
+                         help="Skip the stress test confirmation prompt")
+    args = parser.parse_args()
 
-    with open('hardware_health_report.json', 'w') as f:
-        json.dump(results, f, indent=2, default=str)
+    mode = args.mode
+    if not mode:
+        print("=" * 70)
+        print("HARDWARE HEALTH CHECKER & STRESS TESTER")
+        print("=" * 70)
+        print("1) Hardware Health Check (point-in-time snapshot)")
+        print("2) Stress Test (sustained load - finds problems that only show up over time)")
+        print("3) Both")
+        choice = input("Choose an option [1/2/3, default 1]: ").strip() or '1'
+        mode = {'1': 'health', '2': 'stress', '3': 'both'}.get(choice, 'health')
 
-    print("\nDetailed results saved to: hardware_health_report.json")
-    return results['overall_score']
+    overall_exit_score = 10
+
+    if mode in ('health', 'both'):
+        checker = HardwareChecker()
+        results = checker.run_full_check()
+        with open('hardware_health_report.json', 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        print("\nDetailed results saved to: hardware_health_report.json")
+        overall_exit_score = min(overall_exit_score, results['overall_score'])
+
+    if mode in ('stress', 'both'):
+        if args.duration:
+            tier, tier_seconds = args.duration, DURATION_PRESETS[args.duration]
+        else:
+            tier, tier_seconds = prompt_duration()
+
+        if args.yes or confirm_stress_run():
+            try:
+                stress_results = run_full_stress(tier_seconds, tier)
+            except KeyboardInterrupt:
+                print("\n\nStress test interrupted by user. Partial results were not saved.")
+                return overall_exit_score
+            with open('stress_test_report.json', 'w') as f:
+                json.dump(stress_results, f, indent=2, default=str)
+            print("\n" + generate_stress_report(stress_results))
+            print("\nDetailed results saved to: stress_test_report.json")
+            any_critical = any(
+                'Critical' in i for t in stress_results['tests'].values() for i in t.get('issues', [])
+            )
+            if any_critical:
+                overall_exit_score = min(overall_exit_score, 1)
+        else:
+            print("Stress test cancelled.")
+
+    return overall_exit_score
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     score = main()
     exit(0 if score >= 5 else 1)
