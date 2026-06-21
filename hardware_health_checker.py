@@ -130,6 +130,8 @@ class HardwareChecker:
             'usage_percent': 0,
             'type': 'Unknown',
             'speed_mhz': None,
+            'channels': 'Unknown',
+            'slots_used': None,
             'health_status': 'unknown',
             'issues': []
         }
@@ -156,32 +158,85 @@ class HardwareChecker:
                 free_total = int(free_kb.group(1)) + int(buffers_kb.group(1)) + int(cached_kb.group(1))
                 mem_info['available_gb'] = round(free_total / 1024 / 1024, 2)
         
-        # Try to get RAM type and speed from dmidecode
-        stdout, _ = self.run_command("sudo dmidecode -t memory 2>/dev/null | grep -E 'Type:|Speed:' | head -4")
-        if stdout:
+        # Try to get detailed RAM info from dmidecode (requires sudo)
+        stdout, retcode = self.run_command("sudo dmidecode -t memory 2>/dev/null")
+        if retcode == 0 and stdout:
+            # Get RAM type
             types = re.findall(r'Type:\s*(\S+)', stdout)
-            speeds = re.findall(r'Speed:\s*(\d+)', stdout)
             if types:
-                mem_info['type'] = types[0]
+                # Filter out "Unknown" and get the most common type
+                known_types = [t for t in types if t not in ['Unknown', 'DDR']]
+                if known_types:
+                    mem_info['type'] = max(set(known_types), key=known_types.count)
+                else:
+                    mem_info['type'] = types[0]
+            
+            # Get RAM speed
+            speeds = re.findall(r'Speed:\s*(\d+)', stdout)
+            speeds = [int(s) for s in speeds if s.isdigit() and int(s) > 0]
             if speeds:
-                mem_info['speed_mhz'] = int(speeds[0])
+                mem_info['speed_mhz'] = max(speeds)  # Get max speed
+            
+            # Count slots
+            handles = re.findall(r'Handle:\s*0x\d+', stdout)
+            connectors = re.findall(r'Locator:\s*\S+', stdout)
+            if len(handles) > 0:
+                mem_info['slots_used'] = len([h for h in handles if 'DIMM' in h or 'Bank' in h])
+            
+            # Check for errors in ECC memory
+            if 'ECC' in stdout or 'Error' in stdout:
+                error_matches = re.findall(r'Error\s+Type:\s*(\S+)', stdout)
+                if error_matches and any(e != 'None' for e in error_matches):
+                    mem_info['issues'].append("Warning: Memory errors detected in ECC logs")
+        else:
+            # Fallback: try lshw
+            stdout, _ = self.run_command("sudo lshw -class memory 2>/dev/null | grep -E 'description|product|vendor|size|clock'")
+            if stdout:
+                lines = stdout.split('\n')
+                for line in lines:
+                    if 'DDR' in line.upper():
+                        if 'DDR5' in line.upper():
+                            mem_info['type'] = 'DDR5'
+                        elif 'DDR4' in line.upper():
+                            mem_info['type'] = 'DDR4'
+                        elif 'DDR3' in line.upper():
+                            mem_info['type'] = 'DDR3'
+                        elif 'DDR2' in line.upper():
+                            mem_info['type'] = 'DDR2'
+                    
+                    speed_match = re.search(r'(\d{3,4})\s*MHz', line, re.IGNORECASE)
+                    if speed_match:
+                        mem_info['speed_mhz'] = int(speed_match.group(1))
+        
+        # Additional fallback without sudo
+        if mem_info['type'] == 'Unknown':
+            stdout, _ = self.run_command("cat /sys/devices/system/edac/mc*/mc*/dimm*_dram_dev_type 2>/dev/null")
+            if stdout and 'x8' in stdout:
+                mem_info['type'] = 'DDR (detected via EDAC)'
         
         # Check for memory errors in dmesg
-        stdout, _ = self.run_command("dmesg 2>/dev/null | grep -i 'memory error\\|edac\\|ecc' | tail -5")
+        stdout, _ = self.run_command("dmesg 2>/dev/null | grep -iE 'memory error|edac|ecc|mce|hardware error' | tail -5")
         if stdout:
-            mem_info['issues'].append("Warning: Memory errors detected in system logs")
+            mem_info['issues'].append("Warning: Memory errors detected in system logs - check dmesg for details")
         
-        # Assess health
+        # Assess health based on capacity and usage
         issues = []
         if mem_info['usage_percent'] > 95:
-            issues.append("Critical: Memory usage critically high (>95%)")
+            issues.append("Critical: Memory usage critically high (>95%) - system may become unresponsive")
         elif mem_info['usage_percent'] > 85:
-            issues.append("Warning: Memory usage high (>85%)")
+            issues.append("Warning: Memory usage high (>85%) - consider closing applications or adding RAM")
+        elif mem_info['usage_percent'] > 70:
+            issues.append("Notice: Memory usage moderately high (>70%)")
         
+        # Capacity assessment
         if mem_info['total_gb'] < 2:
-            issues.append("Notice: Very low total memory (<2GB)")
+            issues.append("Critical: Very low total memory (<2GB) - system will struggle with modern applications")
         elif mem_info['total_gb'] < 4:
-            issues.append("Notice: Low total memory (<4GB)")
+            issues.append("Warning: Low total memory (<4GB) - limited multitasking capability")
+        elif mem_info['total_gb'] < 8:
+            issues.append("Notice: Below average memory (<8GB) - may limit performance for demanding tasks")
+        elif mem_info['total_gb'] >= 64:
+            issues.append("Notice: High capacity memory (>=64GB) - excellent for demanding workloads")
         
         mem_info['issues'] = issues + mem_info.get('issues', [])
         mem_info['health_status'] = 'critical' if any('Critical' in i for i in issues) else \
@@ -193,20 +248,63 @@ class HardwareChecker:
         """Check storage devices specifications and health."""
         storage_devices = []
         
-        # Get list of block devices
-        stdout, _ = self.run_command("lsblk -d -o NAME,MODEL,SIZE,TYPE 2>/dev/null | grep disk")
+        # Get list of block devices with better model extraction
+        stdout, _ = self.run_command("lsblk -d -o NAME,MODEL,SIZE,TYPE,SERIAL 2>/dev/null | grep disk")
         if not stdout:
-            return storage_devices
+            # Fallback: just get device names
+            stdout, _ = self.run_command("lsblk -d -o NAME,SIZE 2>/dev/null | grep disk")
+            if not stdout:
+                return storage_devices
         
         lines = stdout.split('\n')
         for line in lines:
             parts = line.split()
-            if len(parts) >= 3:
+            if len(parts) >= 2:
+                dev_name = parts[0]
+                
+                # Try to get model from multiple sources
+                model = 'Unknown'
+                serial = 'N/A'
+                
+                # Try hdparm for model
+                stdout_hdparm, _ = self.run_command(f"sudo hdparm -I /dev/{dev_name} 2>/dev/null | grep 'Model Number'")
+                if stdout_hdparm:
+                    model = stdout_hdparm.replace('Model Number:', '').strip()
+                
+                # Try smartctl for model
+                if model == 'Unknown':
+                    stdout_smart, _ = self.run_command(f"sudo smartctl -i /dev/{dev_name} 2>/dev/null | grep 'Device Model'")
+                    if stdout_smart:
+                        model = stdout_smart.replace('Device Model:', '').strip()
+                
+                # Try lsscsi
+                if model == 'Unknown':
+                    stdout_lsscsi, _ = self.run_command("lsscsi 2>/dev/null")
+                    if stdout_lsscsi and dev_name in stdout_lsscsi:
+                        for lline in stdout_lsscsi.split('\n'):
+                            if dev_name in lline:
+                                # Extract model from lsscsi output
+                                model_parts = lline.split()
+                                if len(model_parts) > 4:
+                                    model = ' '.join(model_parts[4:-1]) if len(model_parts) > 5 else model_parts[-1]
+                                break
+                
+                # Fallback to lsblk model if available
+                if model == 'Unknown' and len(parts) >= 4:
+                    potential_model = ' '.join(parts[1:-2]) if len(parts) > 3 else ''
+                    if potential_model and potential_model != '-':
+                        model = potential_model
+                
+                # Get size
+                size = parts[-2] if len(parts) >= 2 else 'Unknown'
+                dev_type = parts[-1] if len(parts) >= 1 else 'disk'
+                
                 device = {
-                    'name': f"/dev/{parts[0]}",
-                    'model': ' '.join(parts[1:-2]) if len(parts) > 3 else 'Unknown',
-                    'size': parts[-2],
-                    'type': parts[-1],
+                    'name': f"/dev/{dev_name}",
+                    'model': model,
+                    'serial': serial,
+                    'size': size,
+                    'type': dev_type,
                     'health_status': 'unknown',
                     'smart_status': 'unknown',
                     'temperature': None,
@@ -214,42 +312,62 @@ class HardwareChecker:
                     'issues': []
                 }
                 
-                # Try to get SMART data
-                dev_name = parts[0]
-                stdout, _ = self.run_command(f"sudo smartctl -H /dev/{dev_name} 2>/dev/null")
-                if stdout:
+                # Try to get SMART data (may require sudo)
+                stdout, retcode = self.run_command(f"sudo smartctl -H /dev/{dev_name} 2>/dev/null")
+                if retcode == 0 and stdout:
                     if 'PASSED' in stdout:
                         device['smart_status'] = 'passed'
                     elif 'FAILED' in stdout:
                         device['smart_status'] = 'failed'
-                        device['issues'].append("Critical: SMART test failed")
+                        device['issues'].append("Critical: SMART test failed - drive may be failing!")
+                else:
+                    # Can't get SMART, assume OK but note it
+                    device['smart_status'] = 'unavailable'
+                    device['issues'].append("Notice: SMART data unavailable (may need sudo or drive doesn't support it)")
                 
                 # Get more detailed SMART info
-                stdout, _ = self.run_command(f"sudo smartctl -A /dev/{dev_name} 2>/dev/null")
-                if stdout:
+                stdout, retcode = self.run_command(f"sudo smartctl -A /dev/{dev_name} 2>/dev/null")
+                if retcode == 0 and stdout:
                     # Temperature
                     temp_match = re.search(r'Temperature_Current.*?\s+(\d+)', stdout)
+                    if not temp_match:
+                        temp_match = re.search(r'194\s+Temperature_Celsius.*?\s+(\d+)', stdout)
                     if temp_match:
                         device['temperature'] = int(temp_match.group(1))
                     
                     # Power on hours
                     poh_match = re.search(r'Power_On_Hours.*?\s+(\d+)', stdout)
+                    if not poh_match:
+                        poh_match = re.search(r'9\s+Power_On_Hours.*?\s+(\d+)', stdout)
                     if poh_match:
                         device['power_on_hours'] = int(poh_match.group(1))
                     
                     # Check for reallocated sectors
                     realloc_match = re.search(r'Reallocated_Sector_Ct.*?\s+(\d+)', stdout)
+                    if not realloc_match:
+                        realloc_match = re.search(r'5\s+Reallocated_Sector_Ct.*?\s+(\d+)', stdout)
                     if realloc_match and int(realloc_match.group(1)) > 0:
                         count = int(realloc_match.group(1))
                         if count > 100:
-                            device['issues'].append(f"Warning: {count} reallocated sectors")
-                        else:
+                            device['issues'].append(f"Warning: {count} reallocated sectors - monitor closely")
+                        elif count > 10:
                             device['issues'].append(f"Notice: {count} reallocated sectors")
+                        else:
+                            device['issues'].append(f"Notice: {count} reallocated sector(s)")
                     
                     # Check for pending sectors
                     pending_match = re.search(r'Current_Pending_Sector.*?\s+(\d+)', stdout)
+                    if not pending_match:
+                        pending_match = re.search(r'197\s+Current_Pending_Sector.*?\s+(\d+)', stdout)
                     if pending_match and int(pending_match.group(1)) > 0:
-                        device['issues'].append(f"Warning: {pending_match.group(1)} pending sectors")
+                        device['issues'].append(f"Warning: {pending_match.group(1)} pending sectors - possible bad sectors")
+                    
+                    # Check for uncorrectable errors
+                    uncorr_match = re.search(r'Offline_Uncorrectable.*?\s+(\d+)', stdout)
+                    if not uncorr_match:
+                        uncorr_match = re.search(r'198\s+Offline_Uncorrectable.*?\s+(\d+)', stdout)
+                    if uncorr_match and int(uncorr_match.group(1)) > 0:
+                        device['issues'].append(f"Warning: {uncorr_match.group(1)} uncorrectable errors")
                 
                 # Assess health
                 issues = device.get('issues', [])
@@ -266,7 +384,9 @@ class HardwareChecker:
                 if device['power_on_hours']:
                     years = device['power_on_hours'] / 24 / 365
                     if years > 7:
-                        device['issues'].append(f"Notice: Drive is old ({years:.1f} years)")
+                        device['issues'].append(f"Notice: Drive is old ({years:.1f} years) - consider backup")
+                    elif years > 5:
+                        device['issues'].append(f"Notice: Drive has significant usage ({years:.1f} years)")
                 
                 storage_devices.append(device)
         
@@ -275,7 +395,7 @@ class HardwareChecker:
     def check_gpu(self) -> Dict:
         """Check GPU specifications and health."""
         gpu_info = {
-            'name': 'Unknown',
+            'name': 'No GPU detected or integrated graphics',
             'vendor': 'Unknown',
             'memory_mb': None,
             'temperature': None,
@@ -285,49 +405,93 @@ class HardwareChecker:
             'issues': []
         }
         
-        # Try lspci for GPU detection
-        stdout, _ = self.run_command("lspci | grep -i vga")
-        if not stdout:
-            stdout, _ = self.run_command("lspci | grep -i 3d")
-        
+        # Try lspci for GPU detection - look for both VGA and 3D controllers
+        stdout, _ = self.run_command("lspci | grep -iE 'vga|3d|display'")
         if stdout:
-            gpu_info['name'] = stdout.split(': ')[-1] if ': ' in stdout else stdout
+            lines = stdout.split('\n')
+            gpu_devices = []
+            for line in lines:
+                if ': ' in line:
+                    gpu_name = line.split(': ')[-1].strip()
+                    gpu_devices.append(gpu_name)
+            
+            if gpu_devices:
+                gpu_info['name'] = '; '.join(gpu_devices)
+                
+                # Detect vendor
+                gpu_lower = gpu_info['name'].lower()
+                if 'nvidia' in gpu_lower:
+                    gpu_info['vendor'] = 'NVIDIA'
+                elif 'amd' in gpu_lower or 'ati' in gpu_lower or 'radeon' in gpu_lower:
+                    gpu_info['vendor'] = 'AMD'
+                elif 'intel' in gpu_lower:
+                    gpu_info['vendor'] = 'Intel'
+                elif 'vmware' in gpu_lower or 'qemu' in gpu_lower or 'virtual' in gpu_lower:
+                    gpu_info['vendor'] = 'Virtual'
+                    gpu_info['issues'].append("Notice: Virtual/Emulated GPU detected")
         
-        # Try to get NVIDIA GPU info
-        stdout, _ = self.run_command("nvidia-smi --query-gpu=name,memory.total,temperature.gpu,utilization.gpu --format=csv,noheader 2>/dev/null")
+        # Try to get NVIDIA GPU info with detailed specs
+        stdout, _ = self.run_command("nvidia-smi --query-gpu=name,memory.total,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits 2>/dev/null")
         if stdout:
             parts = stdout.split(', ')
-            if len(parts) >= 4:
+            if len(parts) >= 5:
                 gpu_info['name'] = parts[0]
                 gpu_info['vendor'] = 'NVIDIA'
                 try:
-                    gpu_info['memory_mb'] = int(parts[1].replace(' MiB', ''))
-                    gpu_info['temperature'] = int(parts[2].replace(' C', ''))
-                    gpu_info['utilization'] = int(parts[3].replace(' %', ''))
+                    gpu_info['memory_mb'] = int(parts[1])
+                    gpu_info['temperature'] = int(parts[2])
+                    gpu_info['utilization'] = int(parts[3])
+                    gpu_info['driver'] = parts[4]
                 except:
                     pass
-                
-                stdout, _ = self.run_command("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null")
-                if stdout:
-                    gpu_info['driver'] = stdout
+        elif gpu_info['vendor'] == 'NVIDIA':
+            gpu_info['issues'].append("Warning: NVIDIA GPU detected but nvidia-smi failed - driver may not be installed properly")
         
         # Try AMD GPU info
-        if gpu_info['vendor'] == 'Unknown':
+        if gpu_info['vendor'] == 'AMD':
             stdout, _ = self.run_command("rocm-smi --showproductname 2>/dev/null")
             if stdout:
-                gpu_info['vendor'] = 'AMD'
+                gpu_info['driver'] = 'ROCm'
+            
+            # Try to get AMD GPU memory from sysfs
+            stdout, _ = self.run_command("cat /sys/class/drm/card*/device/mem_busy_percent 2>/dev/null | head -1")
+            if stdout:
+                gpu_info['utilization'] = int(stdout.strip()) if stdout.strip().isdigit() else None
+        
+        # Try Intel GPU info
+        if gpu_info['vendor'] == 'Intel':
+            stdout, _ = self.run_command("intel_gpu_top -l 2>/dev/null | head -5")
+            if stdout:
+                gpu_info['driver'] = 'Intel'
+            
+            # Try to get intel graphics info
+            stdout, _ = self.run_command("cat /sys/class/drm/card*/device/device 2>/dev/null | head -1")
+            if stdout:
+                gpu_info['driver'] = f"Intel (device: {stdout.strip()})"
+        
+        # Check if no discrete GPU found
+        if gpu_info['vendor'] in ['Unknown', 'Virtual'] or 'virtual' in gpu_info['name'].lower():
+            gpu_info['issues'].append("Notice: No discrete GPU detected - using integrated graphics or virtual adapter")
+            gpu_info['issues'].append("Notice: Performance may be limited for graphics-intensive tasks")
         
         # Check for GPU errors in dmesg
-        stdout, _ = self.run_command("dmesg 2>/dev/null | grep -i 'gpu\\|graphics\\|drm' | grep -i 'error\\|fault' | tail -3")
+        stdout, _ = self.run_command("dmesg 2>/dev/null | grep -iE 'gpu|graphics|drm|nvidia|radeon|amdgpu|i915' | grep -iE 'error|fault|failed' | tail -3")
         if stdout:
-            gpu_info['issues'].append("Warning: GPU errors detected in system logs")
+            gpu_info['issues'].append("Warning: GPU errors detected in system logs - check dmesg for details")
         
-        # Assess health
+        # Assess health and add temperature warnings
         issues = gpu_info.get('issues', [])
-        if gpu_info['temperature'] and gpu_info['temperature'] > 90:
-            issues.append("Critical: GPU temperature too high (>90°C)")
-        elif gpu_info['temperature'] and gpu_info['temperature'] > 80:
-            issues.append("Warning: GPU temperature elevated (>80°C)")
+        if gpu_info['temperature']:
+            if gpu_info['temperature'] > 90:
+                issues.append("Critical: GPU temperature too high (>90°C) - immediate attention needed!")
+            elif gpu_info['temperature'] > 80:
+                issues.append("Warning: GPU temperature elevated (>80°C) - check cooling")
+            elif gpu_info['temperature'] > 70:
+                issues.append("Notice: GPU temperature moderately high (>70°C)")
+        
+        # Check utilization
+        if gpu_info['utilization'] is not None and gpu_info['utilization'] > 95:
+            issues.append("Notice: GPU utilization very high (>95%)")
         
         gpu_info['issues'] = issues
         gpu_info['health_status'] = 'critical' if any('Critical' in i for i in issues) else \
@@ -658,7 +822,7 @@ class HardwareChecker:
             report.append("ALL DETECTED PROBLEMS")
             report.append("-" * 70)
             for problem in all_problems:
-                report.append(f"⚠ {problem}")
+                report.append(f"[WARNING] {problem}")
             report.append("")
         
         # Overall Score
@@ -670,31 +834,23 @@ class HardwareChecker:
         # Score interpretation
         if overall_score >= 9:
             rating = "PERFECT CONDITION"
-            emoji = "💎"
         elif overall_score >= 8:
             rating = "EXCELLENT"
-            emoji = "⭐"
         elif overall_score >= 7:
             rating = "VERY GOOD"
-            emoji = "✓"
         elif overall_score >= 6:
             rating = "GOOD"
-            emoji = "👍"
         elif overall_score >= 5:
             rating = "FAIR"
-            emoji = "➖"
         elif overall_score >= 4:
             rating = "POOR"
-            emoji = "⚠"
         elif overall_score >= 3:
             rating = "VERY POOR"
-            emoji = "❗"
         else:
             rating = "CRITICAL"
-            emoji = "🚨"
         
         report.append(f"\n  OVERALL SCORE: {overall_score}/10")
-        report.append(f"  RATING: {emoji} {rating}")
+        report.append(f"  RATING: {rating}")
         report.append("\nScore Breakdown:")
         for component, scores in self.results['scores'].items():
             if scores:

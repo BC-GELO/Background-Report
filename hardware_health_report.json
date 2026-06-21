@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-06-21T00:08:23.730032",
+  "timestamp": "2026-06-21T00:23:32.309750",
   "components": {
     "system": {
       "hostname": "c-6a372acf-01471659-fa88b650577d",
       "kernel": "4.19.91-c8dfc93.al7.x86_64",
       "os": "Debian GNU/Linux 12 (bookworm)",
-      "uptime_days": 0.0,
-      "boot_time": "2026-06-21T00:05:30.012008"
+      "uptime_days": 0.01,
+      "boot_time": "2026-06-21T00:05:30.010520"
     },
     "cpu": {
       "name": "Intel(R) Xeon(R) Processor @ 2.50GHz",
@@ -15,67 +15,81 @@
       "current_freq": 2499.998,
       "max_freq": 0,
       "temperature": null,
-      "load": 0.02,
+      "load": 0.0,
       "health_status": "good",
       "issues": []
     },
     "memory": {
       "total_gb": 1.03,
-      "used_gb": 0.35,
-      "available_gb": 0.68,
-      "usage_percent": 34.26,
+      "used_gb": 0.36,
+      "available_gb": 0.67,
+      "usage_percent": 34.68,
       "type": "Unknown",
       "speed_mhz": null,
-      "health_status": "good",
+      "channels": "Unknown",
+      "slots_used": null,
+      "health_status": "critical",
       "issues": [
-        "Notice: Very low total memory (<2GB)",
-        "Warning: Memory errors detected in system logs"
+        "Critical: Very low total memory (<2GB) - system will struggle with modern applications",
+        "Warning: Memory errors detected in system logs - check dmesg for details"
       ]
     },
     "storage": [
       {
         "name": "/dev/zram0",
         "model": "Unknown",
+        "serial": "N/A",
         "size": "0B",
         "type": "disk",
         "health_status": "good",
-        "smart_status": "unknown",
+        "smart_status": "unavailable",
         "temperature": null,
         "power_on_hours": null,
-        "issues": []
+        "issues": [
+          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
+        ]
       },
       {
         "name": "/dev/vda",
         "model": "Unknown",
+        "serial": "N/A",
         "size": "10G",
         "type": "disk",
         "health_status": "good",
-        "smart_status": "unknown",
+        "smart_status": "unavailable",
         "temperature": null,
         "power_on_hours": null,
-        "issues": []
+        "issues": [
+          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
+        ]
       },
       {
         "name": "/dev/pmem0",
         "model": "Unknown",
+        "serial": "N/A",
         "size": "168M",
         "type": "disk",
         "health_status": "good",
-        "smart_status": "unknown",
+        "smart_status": "unavailable",
         "temperature": null,
         "power_on_hours": null,
-        "issues": []
+        "issues": [
+          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
+        ]
       }
     ],
     "gpu": {
-      "name": "Unknown",
+      "name": "No GPU detected or integrated graphics",
       "vendor": "Unknown",
       "memory_mb": null,
       "temperature": null,
       "utilization": null,
       "driver": "Unknown",
       "health_status": "good",
-      "issues": []
+      "issues": [
+        "Notice: No discrete GPU detected - using integrated graphics or virtual adapter",
+        "Notice: Performance may be limited for graphics-intensive tasks"
+      ]
     }
   },
   "problems": [],
@@ -84,19 +98,19 @@
       10
     ],
     "memory": [
-      7
+      3
     ],
     "storage": [
-      10,
-      10,
-      10
+      9,
+      9,
+      9
     ],
     "gpu": [
-      10
+      8
     ],
     "battery": [
       0
     ]
   },
-  "overall_score": 9
+  "overall_score": 8
 }
