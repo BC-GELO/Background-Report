@@ -1,118 +1,96 @@
 {
-  "timestamp": "2026-06-21T00:31:08.634377",
+  "timestamp": "2026-06-20T20:29:13.549427",
   "components": {
     "system": {
-      "hostname": "c-6a372acf-01471659-fa88b650577d",
-      "kernel": "4.19.91-c8dfc93.al7.x86_64",
-      "os": "Debian GNU/Linux 12 (bookworm)",
-      "uptime_days": 0.02,
-      "boot_time": "2026-06-21T00:05:30.004999"
+      "hostname": "DESKTOP-FSNA7LA",
+      "kernel": "10.0.19045",
+      "os": "Microsoft Windows 10 Home",
+      "uptime_days": 5.54,
+      "boot_time": "2026-06-15T07:32:35.242288"
     },
     "cpu": {
-      "name": "Intel(R) Xeon(R) Processor @ 2.50GHz",
+      "name": "Intel(R) Core(TM) i5-6200U CPU @ 2.30GHz",
       "cores": 2,
-      "threads": 2,
-      "current_freq": 2499.998,
-      "max_freq": 0,
+      "threads": 4,
+      "current_freq": 2300.0,
+      "max_freq": 2400.0,
       "temperature": null,
-      "load": 0.0,
+      "load": 2.28,
       "health_status": "good",
-      "issues": []
+      "issues": [
+        "Notice: CPU temperature not available - Windows needs a third-party tool like HWiNFO64 or LibreHardwareMonitor for sensor access",
+        "Notice: High CPU load"
+      ]
     },
     "memory": {
-      "total_gb": 1.03,
-      "used_gb": 0.36,
-      "available_gb": 0.67,
-      "usage_percent": 34.75,
-      "type": "Unknown",
-      "speed_mhz": null,
+      "total_gb": 7.91,
+      "used_gb": 6.08,
+      "available_gb": 1.83,
+      "usage_percent": 76.9,
+      "type": "DDR4",
+      "speed_mhz": 2133,
       "channels": "Unknown",
-      "slots_used": null,
-      "health_status": "critical",
+      "slots_used": 2,
+      "health_status": "good",
       "issues": [
-        "Critical: Very low total memory (<2GB) - system will struggle with modern applications",
-        "Warning: Memory errors detected in system logs - check dmesg for details"
+        "Notice: Memory usage moderately high (>70%)",
+        "Notice: Below average memory (<8GB) - may limit performance for demanding tasks"
       ]
     },
     "storage": [
       {
-        "name": "/dev/zram0",
-        "model": "Unknown",
-        "serial": "N/A",
-        "size": "0B",
-        "type": "disk",
+        "name": "Patriot P210 1024GB",
+        "model": "Patriot P210 1024GB",
+        "serial": "P210EDCB23011105801",
+        "size": "953.9G",
+        "type": "SSD",
         "health_status": "good",
-        "smart_status": "unavailable",
+        "smart_status": "passed",
         "temperature": null,
         "power_on_hours": null,
-        "issues": [
-          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
-        ]
-      },
-      {
-        "name": "/dev/vda",
-        "model": "Unknown",
-        "serial": "N/A",
-        "size": "10G",
-        "type": "disk",
-        "health_status": "good",
-        "smart_status": "unavailable",
-        "temperature": null,
-        "power_on_hours": null,
-        "issues": [
-          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
-        ]
-      },
-      {
-        "name": "/dev/pmem0",
-        "model": "Unknown",
-        "serial": "N/A",
-        "size": "168M",
-        "type": "disk",
-        "health_status": "good",
-        "smart_status": "unavailable",
-        "temperature": null,
-        "power_on_hours": null,
-        "issues": [
-          "Notice: SMART data unavailable (may need sudo or drive doesn't support it)"
-        ]
+        "issues": []
       }
     ],
     "gpu": {
-      "name": "Virtual/Cloud Environment (No direct GPU access)",
-      "vendor": "Virtual",
-      "memory_mb": null,
-      "temperature": null,
-      "utilization": null,
-      "driver": "Unknown",
+      "name": "NVIDIA GeForce 940MX",
+      "vendor": "NVIDIA",
+      "memory_mb": 4096,
+      "temperature": 0,
+      "utilization": 60,
+      "driver": "582.28",
+      "health_status": "good",
+      "issues": []
+    },
+    "battery": {
+      "present": true,
+      "status": "Charging",
+      "capacity_percent": 100,
+      "design_capacity_mah": null,
+      "current_capacity_mah": null,
+      "voltage": null,
       "health_status": "good",
       "issues": [
-        "Notice: Running in virtualized environment",
-        "Notice: GPU detection limited in VM/cloud instances",
-        "Notice: Running in virtualized/cloud environment",
-        "Notice: GPU detection limited - cloud instances typically use virtual adapters"
+        "Notice: Battery wear level needs a generated report - run 'powercfg /batteryreport' in an elevated prompt and open the HTML file"
       ]
     }
   },
   "problems": [],
   "scores": {
     "cpu": [
-      10
+      8
     ],
     "memory": [
-      3
+      8
     ],
     "storage": [
-      9,
-      9,
-      9
+      10
     ],
     "gpu": [
-      6
+      10
     ],
     "battery": [
-      0
+      9
     ]
   },
-  "overall_score": 7
+  "overall_score": 9
 }
