@@ -51,6 +51,66 @@ IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
 
+# GPU vendor PCI IDs
+VENDOR_NVIDIA = 0x10DE
+VENDOR_AMD = 0x1002
+VENDOR_INTEL = 0x8086
+VENDOR_MAP = {VENDOR_NVIDIA: 'NVIDIA', VENDOR_AMD: 'AMD', VENDOR_INTEL: 'Intel'}
+
+
+def _check_available_backends(vendor_id: Optional[int] = None) -> List[str]:
+    """Probe for available GPU compute load backends.
+
+    Returns a list of backend names that can generate real GPU load:
+    - 'vulkan':  Vulkan compute (ships with every modern GPU driver)
+    - 'opencl':  OpenCL compute (vendor-specific ICDs)
+    - 'cuda':    CUDA via PyTorch (NVIDIA only)
+    """
+    backends: List[str] = []
+
+    def _dll_available(dll_name: str) -> bool:
+        try:
+            import ctypes
+            ctypes.windll.LoadLibrary(dll_name)
+            return True
+        except Exception:
+            return False
+
+    # Vulkan: present on Windows 10+ with any modern GPU driver
+    if IS_WINDOWS:
+        if _dll_available('vulkan.dll'):
+            backends.append('vulkan')
+    elif IS_LINUX:
+        if shutil.which('vulkaninfo') or any(
+            os.path.exists(p) for p in
+            ('/usr/lib/x86_64-linux-gnu/libvulkan.so',
+             '/usr/lib/libvulkan.so')
+        ):
+            backends.append('vulkan')
+    elif IS_MAC:
+        backends.append('vulkan')  # MoltenVK always available on macOS
+
+    # OpenCL
+    if IS_WINDOWS:
+        if _dll_available('OpenCL.dll'):
+            backends.append('opencl')
+    elif IS_LINUX:
+        if any(os.path.exists(p) for p in
+               ('/usr/lib/x86_64-linux-gnu/libOpenCL.so',
+                '/usr/lib/libOpenCL.so')) or shutil.which('clinfo'):
+            backends.append('opencl')
+
+    # CUDA: requires PyTorch with CUDA support (NVIDIA only)
+    if vendor_id == VENDOR_NVIDIA:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                backends.append('cuda')
+        except ImportError:
+            pass
+
+    return backends
+
 
 class HardwareChecker:
     def __init__(self):
@@ -558,23 +618,38 @@ class HardwareChecker:
     def check_gpu(self) -> Dict:
         """Check GPU specifications and health."""
         gpu_info = {
-            'name': 'No GPU detected or integrated graphics', 'vendor': 'Unknown',
-            'memory_mb': None, 'temperature': None, 'utilization': None,
-            'driver': 'Unknown', 'health_status': 'unknown', 'issues': []
+            'name': 'No GPU detected or integrated graphics',
+            'vendor': 'Unknown',
+            'vendor_id': None,
+            'memory_mb': None,
+            'vram_mb': None,
+            'temperature': None,
+            'utilization': None,
+            'driver': 'Unknown',
+            'health_status': 'unknown',
+            'issues': [],
+            'load_backends': []
         }
 
         def set_vendor_from_name():
             gpu_lower = gpu_info['name'].lower()
             if 'nvidia' in gpu_lower:
                 gpu_info['vendor'] = 'NVIDIA'
+                if gpu_info['vendor_id'] is None:
+                    gpu_info['vendor_id'] = VENDOR_NVIDIA
             elif 'amd' in gpu_lower or 'ati' in gpu_lower or 'radeon' in gpu_lower:
                 gpu_info['vendor'] = 'AMD'
+                if gpu_info['vendor_id'] is None:
+                    gpu_info['vendor_id'] = VENDOR_AMD
             elif 'intel' in gpu_lower:
                 gpu_info['vendor'] = 'Intel'
+                if gpu_info['vendor_id'] is None:
+                    gpu_info['vendor_id'] = VENDOR_INTEL
 
         if IS_WINDOWS:
             data = self.run_powershell(
-                "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion"
+                "Get-CimInstance Win32_VideoController | "
+                "Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM"
             )
             gpus = data if isinstance(data, list) else ([data] if data else [])
             if gpus:
@@ -587,6 +662,12 @@ class HardwareChecker:
                     # VRAM - only trust it in the safe range, prefer nvidia-smi otherwise.
                     if ram and 0 < ram < 4_000_000_000:
                         gpu_info['memory_mb'] = round(ram / (1024 ** 2))
+                    # Extract vendor from PNPDeviceID (VEN_10DE=NVIDIA, VEN_1002=AMD, VEN_8086=Intel)
+                    pnp = gpus[0].get('PNPDeviceID', '')
+                    if pnp:
+                        m = re.search(r'VEN_([0-9A-Fa-f]{4})', pnp)
+                        if m:
+                            gpu_info['vendor_id'] = int(m.group(1), 16)
                     set_vendor_from_name()
 
         elif IS_LINUX:
@@ -631,9 +712,11 @@ class HardwareChecker:
                 if names:
                     gpu_info['name'] = '; '.join(names)
                     gpu_info['vendor'] = 'NVIDIA'
+                    gpu_info['vendor_id'] = VENDOR_NVIDIA
                 if first_parts and len(first_parts) >= 5:
                     try:
                         gpu_info['memory_mb'] = int(first_parts[1])
+                        gpu_info['vram_mb'] = int(first_parts[1])
                         gpu_info['temperature'] = int(first_parts[2])
                         gpu_info['utilization'] = int(first_parts[3])
                         gpu_info['driver'] = first_parts[4]
@@ -645,9 +728,18 @@ class HardwareChecker:
                 "driver may not be installed correctly"
             )
 
+        # Detect available GPU compute load backends
+        gpu_info['load_backends'] = _check_available_backends(gpu_info.get('vendor_id'))
+
         if gpu_info['vendor'] == 'Unknown':
             gpu_info['issues'].append("Notice: No GPU detected - system may use basic display adapter")
             gpu_info['issues'].append("Notice: Graphics performance may be limited")
+
+        if not gpu_info['load_backends']:
+            gpu_info['issues'].append(
+                "Notice: No GPU compute load backends available - stress test will be monitoring-only. "
+                "Install Vulkan-capable drivers or PyTorch with CUDA for full GPU stress testing."
+            )
 
         issues = gpu_info['issues']
         if gpu_info['temperature']:
@@ -1327,19 +1419,56 @@ class StressTester:
 
     # -- GPU ------------------------------------------------------------------
 
+    def _select_gpu_backend(self) -> Optional[str]:
+        """Select the best GPU compute backend based on GPU vendor and availability.
+
+        Returns backend name string ('vulkan', 'opencl', or 'cuda') or None.
+        Priority order: Vulkan (most portable) -> OpenCL (cross-vendor) -> CUDA (NVIDIA only).
+        """
+        # Get available backends from the GPU info
+        gpu_info = self.results['components'].get('gpu', {})
+        load_backends = gpu_info.get('load_backends', [])
+
+        # Prioritize Vulkan (most portable, all modern GPU drivers)
+        if 'vulkan' in load_backends:
+            return 'vulkan'
+
+        # OpenCL (cross-vendor, may need pyopencl)
+        if 'opencl' in load_backends:
+            return 'opencl'
+
+        # CUDA (NVIDIA only, PyTorch)
+        if torch_cuda := __import__('torch', fromlist=['cuda']).cuda.is_available():
+            return 'cuda'
+
+        # No compute backend available
+        return None
+
     def stress_gpu(self, duration_seconds: int) -> Dict:
+        """Run GPU stress test with compute load via available backends.
+
+        Uses Vulkan, OpenCL, or CUDA depending on GPU vendor and available
+        libraries. Falls back to monitoring-only if no compute backend is available.
+
+        Args:
+            duration_seconds: Test duration in seconds (default presets: quick=60, standard=300, extended=900)
+
+        Returns:
+            Dict with compute_load_generated, samples_collected, max_temp_c,
+            avg_utilization_percent, issues, health_status fields.
+        """
         has_nvidia_smi = shutil.which('nvidia-smi') is not None
-        torch_mod = None
-        torch_cuda = False
+
+        # Import available modules for CUDA backend detection
         try:
-            import torch as torch_mod  # noqa: local import, optional dependency
-            torch_cuda = torch_mod.cuda.is_available()
+            import torch as _torch_local  # noqa: local import, optional dependency
         except ImportError:
-            pass
+            _torch_local = None
 
-        print(f"\n[GPU] {'Generating CUDA compute load' if torch_cuda else 'Monitoring only (no compute load)'} "
-              f"for {duration_seconds if torch_cuda else min(duration_seconds, 10)}s...")
+        # Select backend based on GPU vendor and availability
+        backend_name = self._select_gpu_backend()
 
+        # Initialize monitoring thread (nvidia-smi polling)
         samples: List[Dict] = []
         stop_evt = threading.Event()
 
@@ -1355,65 +1484,119 @@ class StressTester:
             mon_thread = threading.Thread(target=monitor_loop, daemon=True)
             mon_thread.start()
 
-        compute_error = None
-        if torch_cuda:
-            try:
-                device = torch_mod.device('cuda')
-                a = torch_mod.randn((4096, 4096), device=device)
-                b = torch_mod.randn((4096, 4096), device=device)
-                end_time = time.time() + duration_seconds
-                while time.time() < end_time:
-                    _ = a @ b
-                    torch_mod.cuda.synchronize()
-            except Exception as e:
-                compute_error = str(e)
-        else:
-            # No compute backend available - keep a short monitoring window only
-            time.sleep(min(duration_seconds, 10))
+        # Initialize backend and run compute load
+        compute_result = None
+        issues: List[str] = []
 
-        stop_evt.set()
-        if mon_thread:
-            mon_thread.join(timeout=5)
+        try:
+            backend_obj = None
 
-        result = {
-            'compute_load_generated': torch_cuda and not compute_error,
-            'samples_collected': len(samples),
-            'issues': []
-        }
+            if backend_name == 'vulkan':
+                # Vulkan compute backend
+                from gpu_load import VulkanComputeBackend
+                backend_obj = VulkanComputeBackend()
+                if backend_obj._initialize_vulkan():
+                    compute_result = backend_obj.start_load(duration_seconds)
+                    if compute_result and compute_result.metrics:
+                        issues.extend(backend_obj.get_metrics().get('issues', []))
 
-        if not has_nvidia_smi:
-            result['issues'].append(
-                "Notice: nvidia-smi not found - can't monitor GPU temp/utilization "
-                "(non-NVIDIA GPU, or driver tools not on PATH)"
-            )
-        if not torch_cuda:
-            result['issues'].append(
-                "Notice: No CUDA-capable PyTorch found, so no real compute load was generated - "
-                "install torch in your AI workstation's environment for a true GPU stress test, "
-                "or use a dedicated tool like FurMark (Windows) / gpu-burn (Linux)"
-            )
-        if compute_error:
-            result['issues'].append(f"Critical: GPU compute load failed mid-test - {compute_error}")
+            elif backend_name == 'opencl':
+                # OpenCL compute backend
+                from gpu_load import OpenCLComputeBackend
+                backend_obj = OpenCLComputeBackend()
+                if backend_obj._initialize_opencl():
+                    compute_result = backend_obj.start_load(duration_seconds)
+                    if compute_result and compute_result.metrics:
+                        issues.extend(backend_obj.get_metrics().get('issues', []))
 
-        if samples:
-            temps = [s['temp_c'] for s in samples if s.get('temp_c') is not None]
-            utils = [s['util_percent'] for s in samples if s.get('util_percent') is not None]
-            if temps:
-                result['max_temp_c'] = max(temps)
-                if result['max_temp_c'] > 90:
-                    result['issues'].append(f"Critical: GPU hit {result['max_temp_c']}°C under load")
-                elif result['max_temp_c'] > 83:
-                    result['issues'].append(f"Warning: GPU reached {result['max_temp_c']}°C under load")
-            if utils:
-                result['avg_utilization_percent'] = round(sum(utils) / len(utils), 1)
-                if torch_cuda and not compute_error and result['avg_utilization_percent'] < 50:
-                    result['issues'].append(
-                        "Notice: GPU utilization stayed low during the compute test - load may not have been effective"
-                    )
+            elif backend_name == 'cuda':
+                # CUDA backend (PyTorch)
+                _torch_local = None
+                try:
+                    import torch as _torch_local
+                    _torch_local.cuda.is_available()
+                except ImportError:
+                    pass
+                if _torch_local and _torch_local.cuda.is_available():
+                    # Warmup
+                    with _torch_local.amp.autocast('cuda'):
+                        _ = _torch_local.randn((4096, 4096), device=_torch_local.device('cuda')) @ _torch_local.randn((4096, 4096), device=_torch_local.device('cuda'))
+                    _torch_local.cuda.synchronize()
 
-        result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else \
-                                   'warning' if any('Warning' in i for i in result['issues']) else 'good'
-        return result
+                    # Run stress test
+                    start_time = time.time()
+                    iterations = 0
+                    while time.time() < time.time() + duration_seconds:
+                        _ = _torch_local.randn((4096, 4096), device=_torch_local.device('cuda')) @ _torch_local.randn((4096, 4096), device=_torch_local.device('cuda'))
+                        _torch_local.cuda.synchronize()
+                        iterations += 1
+
+                    elapsed = time.time() - start_time
+                    compute_result = {
+                        'duration': elapsed,
+                        'iterations': iterations,
+                        'work_per_second': iterations / elapsed if elapsed > 0 else 0,
+                        'backend': 'cuda',
+                        'matrix_size': 4096
+                    }
+
+            elif backend_name is None:
+                # No compute backend - monitoring only
+                time.sleep(min(duration_seconds, 30))
+
+            # Handle results
+            result = {
+                'compute_load_generated': compute_result is not None and compute_result.get('work_per_second', 0) > 0,
+                'samples_collected': len(samples),
+                'max_temp_c': None,
+                'avg_utilization_percent': None,
+                'issues': issues,
+            }
+
+            # Parse monitoring data
+            if samples:
+                temps = [s['temp_c'] for s in samples if s.get('temp_c') is not None]
+                utils = [s['util_percent'] for s in samples if s.get('util_percent') is not None]
+
+                if temps:
+                    result['max_temp_c'] = round(max(temps), 1)
+                    if result['max_temp_c'] > 90:
+                        result['issues'].append(f"Critical: GPU hit {result['max_temp_c']}°C under load")
+                    elif result['max_temp_c'] > 83:
+                        result['issues'].append(f"Warning: GPU reached {result['max_temp_c']}°C under load")
+
+                if utils:
+                    result['avg_utilization_percent'] = round(sum(utils) / len(utils), 1)
+                    # Note: utilization monitoring requires nvidia-smi, which is Windows+ NVIDIA
+                    # On other platforms, this may not be reliable
+
+            # Mark if load was effective
+            effective = compute_result is not None and compute_result.get('work_per_second', 0) > 0
+            if not effective and backend_name is not None:
+                result['issues'].append(
+                    "Notice: GPU compute load generation effective - "
+                    "consider installing Vulkan drivers, PyOpenCL, or PyTorch with CUDA for full GPU stress testing."
+                )
+            if not effective and backend_name is None:
+                result['issues'].append(
+                    "Notice: No GPU compute backend available - stress test will be monitoring-only."
+                )
+
+            result['health_status'] = 'critical' if any('Critical' in i for i in result['issues']) else \
+                                       'warning' if any('Warning' in i for i in result['issues']) else 'good'
+
+            return result
+
+        except Exception as e:
+            result = {
+                'compute_load_generated': False,
+                'samples_collected': len(samples),
+                'max_temp_c': None,
+                'avg_utilization_percent': None,
+                'issues': [f"Critical: GPU stress test failed - {str(e)}"],
+                'health_status': 'critical'
+            }
+            return result
 
 
 def run_full_stress(duration_seconds: int, duration_tier: str) -> Dict:

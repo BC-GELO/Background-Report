@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-06-20T20:29:31.494665",
+  "timestamp": "2026-07-21T17:02:06.672904",
   "duration_tier": "quick",
   "duration_seconds": 60,
   "tests": {
@@ -19,19 +19,19 @@
       "health_status": "good"
     },
     "memory": {
-      "tested_gb": 0.94,
-      "cycles_completed": 38,
+      "tested_gb": 0.62,
+      "cycles_completed": 61,
       "pattern_errors": 0,
       "issues": [],
       "health_status": "good"
     },
     "disk": {
       "tested_file_gb": 2.0,
-      "cycles_completed": 3,
-      "avg_write_mbps": 234.3,
-      "avg_read_mbps": 168.1,
-      "min_write_mbps": 209.2,
-      "min_read_mbps": 166.8,
+      "cycles_completed": 4,
+      "avg_write_mbps": 242.4,
+      "avg_read_mbps": 268.2,
+      "min_write_mbps": 232.8,
+      "min_read_mbps": 242.1,
       "issues": [],
       "health_status": "good"
     },
@@ -42,7 +42,7 @@
         "Notice: No CUDA-capable PyTorch found, so no real compute load was generated - install torch in your AI workstation's environment for a true GPU stress test, or use a dedicated tool like FurMark (Windows) / gpu-burn (Linux)"
       ],
       "max_temp_c": 0,
-      "avg_utilization_percent": 0.0,
+      "avg_utilization_percent": 0.6,
       "health_status": "good"
     }
   }
